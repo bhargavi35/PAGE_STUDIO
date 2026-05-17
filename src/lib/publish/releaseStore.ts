@@ -1,91 +1,46 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import type { Page, Release } from "@/types/page";
 
 /**
- * Filesystem-backed release store. Each release is an immutable JSON snapshot
- * at releases/<slug>/<version>.json. The latest pointer lives at
- * releases/<slug>/latest.json. This is intentionally simple — a production
- * deployment would swap this for blob storage (S3, Vercel Blob) or a database.
+ * In-memory release store. Releases live in a module-scope Map keyed by slug
+ * and ordered newest-first. State survives within a warm serverless instance
+ * but is reset on cold start and on every deploy.
  *
- * Why filesystem on Vercel? The repo's releases/ directory is committed; the
- * brief asks for an immutable, versioned artefact and this gives reviewers
- * git-visible evidence of the publish flow without standing up infra.
+ * This is a deliberate demo-grade choice — the brief asks for an immutable
+ * versioned snapshot, but Vercel's serverless filesystem is read-only outside
+ * /tmp (which itself is ephemeral). A production deployment would back this
+ * with Vercel Blob / S3 / a database; the public function signatures here are
+ * shaped so that swap is a one-file change. Flagged in README "What is not
+ * included".
  *
- * Caveat: on Vercel's serverless runtime, FS writes outside /tmp are
- * ephemeral. For production we'd switch to blob storage — flagged in README.
+ * The `globalThis` keying is purely so Next.js dev-mode HMR doesn't wipe the
+ * store between hot reloads — it has no effect in production.
  */
 
-const RELEASES_ROOT = path.join(process.cwd(), "releases");
+type Store = Map<string, Release[]>;
 
-function slugDir(slug: string) {
-  return path.join(RELEASES_ROOT, slug);
+const STORE_KEY = "__pageStudioReleaseStore__";
+
+function getStore(): Store {
+  const g = globalThis as unknown as Record<string, Store | undefined>;
+  if (!g[STORE_KEY]) g[STORE_KEY] = new Map();
+  return g[STORE_KEY]!;
 }
 
-function versionFile(slug: string, version: string) {
-  return path.join(slugDir(slug), `${version}.json`);
-}
-
-function latestFile(slug: string) {
-  return path.join(slugDir(slug), "latest.json");
-}
-
-async function ensureDir(p: string) {
-  await fs.mkdir(p, { recursive: true });
-}
-
-async function safeReadJson<T>(p: string): Promise<T | null> {
-  try {
-    const buf = await fs.readFile(p, "utf8");
-    return JSON.parse(buf) as T;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw err;
-  }
-}
-
-/**
- * Read the release history for a slug, newest first. Returns [] if no
- * releases have been published yet.
- */
 export async function getReleaseHistory(slug: string): Promise<Release[]> {
-  const dir = slugDir(slug);
-  try {
-    const files = await fs.readdir(dir);
-    const versionFiles = files.filter((f) => /^\d+\.\d+\.\d+\.json$/.test(f));
-    const releases = await Promise.all(
-      versionFiles.map(async (f) => {
-        const data = await safeReadJson<Release>(path.join(dir, f));
-        return data;
-      }),
-    );
-    return releases
-      .filter((r): r is Release => r !== null)
-      .sort((a, b) => compareSemVer(b.version, a.version));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw err;
-  }
+  const list = getStore().get(slug);
+  return list ? [...list] : [];
 }
 
 export async function getLatestRelease(slug: string): Promise<Release | null> {
-  return safeReadJson<Release>(latestFile(slug));
+  const list = getStore().get(slug);
+  return list && list.length > 0 ? list[0] : null;
 }
 
-/**
- * Write a release atomically: write to a temp path, then rename. Prevents
- * partial-write corruption if the process is killed mid-publish.
- */
 export async function writeRelease(release: Release): Promise<void> {
-  await ensureDir(slugDir(release.slug));
-  const finalPath = versionFile(release.slug, release.version);
-  const tmpPath = `${finalPath}.tmp`;
-  const json = JSON.stringify(release, null, 2);
-  await fs.writeFile(tmpPath, json, "utf8");
-  await fs.rename(tmpPath, finalPath);
-
-  // Update the latest pointer (overwrite is fine — it's a pointer, not an artefact).
-  await fs.writeFile(latestFile(release.slug), json, "utf8");
+  const store = getStore();
+  const existing = store.get(release.slug) ?? [];
+  // Newest first; preserve immutability by replacing rather than mutating.
+  store.set(release.slug, [release, ...existing.filter((r) => r.version !== release.version)]);
 }
 
 /** Page-only snapshot equality for idempotency checks. */
@@ -100,13 +55,4 @@ function stableStringify(value: unknown): string {
   return `{${keys
     .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`)
     .join(",")}}`;
-}
-
-function compareSemVer(a: string, b: string): number {
-  const aParts = a.split(".").map(Number);
-  const bParts = b.split(".").map(Number);
-  for (let i = 0; i < 3; i += 1) {
-    if (aParts[i] !== bParts[i]) return aParts[i] - bParts[i];
-  }
-  return 0;
 }

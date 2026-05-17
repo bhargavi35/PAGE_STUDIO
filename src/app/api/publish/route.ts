@@ -24,75 +24,85 @@ import type { Release } from "@/types/page";
  *      release on disk), NOT from anything the client claims.
  */
 export async function POST(request: NextRequest) {
-  const role = await getCurrentRole();
-  if (!can(role, "canPublish")) {
-    return NextResponse.json(
-      { error: "forbidden", reason: "publish role required" },
-      { status: 403 },
-    );
-  }
-
-  let body: unknown;
   try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "invalid_body" }, { status: 400 });
-  }
+    const role = await getCurrentRole();
+    if (!can(role, "canPublish")) {
+      return NextResponse.json(
+        { error: "forbidden", reason: "publish role required" },
+        { status: 403 },
+      );
+    }
 
-  const parsed = parseBody(body);
-  if (!parsed.ok) {
-    return NextResponse.json({ error: "invalid_body", reason: parsed.reason }, { status: 400 });
-  }
-  const { slug, draft } = parsed;
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return NextResponse.json({ error: "invalid_body" }, { status: 400 });
+    }
 
-  if (draft.slug !== slug) {
+    const parsed = parseBody(body);
+    if (!parsed.ok) {
+      return NextResponse.json({ error: "invalid_body", reason: parsed.reason }, { status: 400 });
+    }
+    const { slug, draft } = parsed;
+
+    if (draft.slug !== slug) {
+      return NextResponse.json(
+        { error: "slug_mismatch", reason: "draft.slug must equal route slug" },
+        { status: 400 },
+      );
+    }
+
+    const latest = await getLatestRelease(slug);
+    const baseline = latest?.snapshot ?? draft;
+
+    // Idempotency: publishing the same content twice doesn't create a new release.
+    if (latest && pagesEqualForIdempotency(latest.snapshot, draft)) {
+      return NextResponse.json({
+        status: "noop",
+        version: latest.version,
+        bump: "none",
+        changelog: [],
+        publishedBy: latest.publishedBy,
+        createdAt: latest.createdAt,
+      });
+    }
+
+    const bump = latest ? calculateSemVerBump(baseline, draft) : "minor";
+    const previousVersion = latest?.version ?? "0.9.0";
+    const version = latest ? applyBump(previousVersion, bump) : INITIAL_VERSION;
+    const changelog = latest ? buildChangelog(baseline, draft) : ["Initial release"];
+
+    const release: Release = {
+      pageId: draft.pageId,
+      slug,
+      version,
+      bump,
+      changelog,
+      snapshot: draft,
+      createdAt: new Date().toISOString(),
+      publishedBy: `role:${role}`,
+    };
+
+    await writeRelease(release);
+
+    return NextResponse.json({
+      status: "published",
+      version: release.version,
+      bump: release.bump,
+      changelog: release.changelog,
+      publishedBy: release.publishedBy,
+      createdAt: release.createdAt,
+    });
+  } catch (err) {
+    // Never leak a raw stack to clients, but log it so Vercel function logs
+    // still show the cause. The studio UI already renders `reason` when set.
+    console.error("[publish] unhandled error", err);
     return NextResponse.json(
-      { error: "slug_mismatch", reason: "draft.slug must equal route slug" },
-      { status: 400 },
+      { error: "publish_failed", reason: err instanceof Error ? err.message : "unknown error" },
+      { status: 500 },
     );
   }
-
-  const latest = await getLatestRelease(slug);
-  const baseline = latest?.snapshot ?? draft;
-
-  // Idempotency: publishing the same content twice doesn't create a new release.
-  if (latest && pagesEqualForIdempotency(latest.snapshot, draft)) {
-    return NextResponse.json({
-      status: "noop",
-      version: latest.version,
-      bump: "none",
-      changelog: [],
-      publishedBy: latest.publishedBy,
-      createdAt: latest.createdAt,
-    });
-  }
-
-  const bump = latest ? calculateSemVerBump(baseline, draft) : "minor";
-  const previousVersion = latest?.version ?? "0.9.0";
-  const version = latest ? applyBump(previousVersion, bump) : INITIAL_VERSION;
-  const changelog = latest ? buildChangelog(baseline, draft) : ["Initial release"];
-
-  const release: Release = {
-    pageId: draft.pageId,
-    slug,
-    version,
-    bump,
-    changelog,
-    snapshot: draft,
-    createdAt: new Date().toISOString(),
-    publishedBy: `role:${role}`,
-  };
-
-  await writeRelease(release);
-
-  return NextResponse.json({
-    status: "published",
-    version: release.version,
-    bump: release.bump,
-    changelog: release.changelog,
-    publishedBy: release.publishedBy,
-    createdAt: release.createdAt,
-  });
 }
 
 type ParseOk = { ok: true; slug: string; draft: import("@/types/page").Page };

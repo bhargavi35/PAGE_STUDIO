@@ -10,6 +10,13 @@ import type { Page, Section, SectionType } from "@/types/page";
  * style without producing actual mutations to current state.
  */
 
+// JSON-deep-clone. Page is JSON-shaped by Zod schema, and unlike clonePage
+// this works on Immer Proxy drafts — clonePage trips on the Proxy's
+// internal traps and throws "could not be cloned".
+function clonePage<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
 export interface DraftPageState {
   draft: Page | null;
   original: Page | null;
@@ -56,8 +63,8 @@ export const draftPageSlice = createSlice({
   reducers: {
     /** Hydrate the editor from the published/source page. Resets dirty flag. */
     setPage(state, action: PayloadAction<Page>) {
-      state.draft = structuredClone(action.payload);
-      state.original = structuredClone(action.payload);
+      state.draft = clonePage(action.payload);
+      state.original = clonePage(action.payload);
       state.isDirty = false;
     },
     /** Edit a section's props (shallow merge). Marks dirty. */
@@ -100,13 +107,13 @@ export const draftPageSlice = createSlice({
     /** Mark the current draft as the new baseline (called after a successful publish). */
     markPublished(state) {
       if (!state.draft) return;
-      state.original = structuredClone(state.draft);
+      state.original = clonePage(state.draft);
       state.isDirty = false;
     },
     /** Discard local changes and revert to the original page. */
     resetDraft(state) {
       if (!state.original) return;
-      state.draft = structuredClone(state.original);
+      state.draft = clonePage(state.original);
       state.isDirty = false;
     },
   },
