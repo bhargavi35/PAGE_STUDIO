@@ -1,0 +1,3 @@
+# Placeholder so the releases/ directory ships in the repo.
+# Published releases land in releases/<slug>/<version>.json
+# (immutable snapshots, written by /api/publish).
